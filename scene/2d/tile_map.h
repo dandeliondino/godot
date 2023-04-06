@@ -112,6 +112,16 @@ class TileMap : public Node2D {
 	GDCLASS(TileMap, Node2D);
 
 public:
+	enum ConstraintOrigin {
+		ORIGIN_PAINTED_TERRAIN,
+		ORIGIN_NEIGHBOR_TERRAIN_IS_PAINTED_TERRAIN,
+		ORIGIN_PATH_NEIGHBOR,
+		ORIGIN_ADDED_PATTERN,
+		ORIGIN_OVERLAPPING_BITS,
+		ORIGIN_CURRENT_TERRAIN,
+		ORIGIN_DEFAULT_TO_CURRENT_TILE,
+	};
+
 	class TerrainConstraint {
 	private:
 		const TileMap *tile_map;
@@ -120,6 +130,10 @@ public:
 		int terrain = -1;
 
 		int priority = 1;
+
+		Vector2i original_coords;
+		int original_bit = -1;
+		TileMap::ConstraintOrigin origin;
 
 	public:
 		bool operator<(const TerrainConstraint &p_other) const {
@@ -158,6 +172,23 @@ public:
 		int get_priority() const {
 			return priority;
 		}
+
+		Vector2i get_original_coords() const {
+			return original_coords;
+		}
+
+		int get_original_bit() const {
+			return original_bit;
+		}
+
+		void set_origin(TileMap::ConstraintOrigin p_origin) {
+			origin = p_origin;
+		}
+
+		TileMap::ConstraintOrigin get_origin() const {
+			return origin;
+		}
+
 
 		TerrainConstraint(const TileMap *p_tile_map, const Vector2i &p_position, int p_terrain); // For the center terrain bit
 		TerrainConstraint(const TileMap *p_tile_map, const Vector2i &p_position, const TileSet::CellNeighbor &p_bit, int p_terrain); // For peering bits
@@ -422,6 +453,7 @@ public:
 	~TileMap();
 };
 
+VARIANT_ENUM_CAST(TileMap::ConstraintOrigin);
 VARIANT_ENUM_CAST(TileMap::VisibilityMode);
 
 #endif // TILE_MAP_H

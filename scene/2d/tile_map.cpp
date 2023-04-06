@@ -153,6 +153,7 @@ TileMap::TerrainConstraint::TerrainConstraint(const TileMap *p_tile_map, const V
 	Ref<TileSet> ts = tile_map->get_tileset();
 	ERR_FAIL_COND(!ts.is_valid());
 
+	original_coords = p_position;
 	bit = 0;
 	base_cell_coords = p_position;
 	terrain = p_terrain;
@@ -161,6 +162,8 @@ TileMap::TerrainConstraint::TerrainConstraint(const TileMap *p_tile_map, const V
 TileMap::TerrainConstraint::TerrainConstraint(const TileMap *p_tile_map, const Vector2i &p_position, const TileSet::CellNeighbor &p_bit, int p_terrain) {
 	// The way we build the constraint make it easy to detect conflicting constraints.
 	tile_map = p_tile_map;
+	original_coords = p_position;
+	original_bit = p_bit;
 
 	Ref<TileSet> ts = tile_map->get_tileset();
 	ERR_FAIL_COND(!ts.is_valid());
@@ -2309,6 +2312,57 @@ TileSet::TerrainsPattern TileMap::_get_best_terrain_pattern_for_constraints(int 
 	if (!tile_set.is_valid()) {
 		return TileSet::TerrainsPattern();
 	}
+
+	// TERRAIN DEBUGGER
+	// Data is stored as TypedArray and Dictionary
+	// to allow transmitting it via a signal to GDscript
+	const int null_terrain = -99;
+	const int null_priority = -1;
+	const int required_priority = 999;
+	const int center_bit_id = 99;
+	const int null_origin = -1;
+
+	// evaluated_terrain_bits records what terrain bits are
+	// taken into account at the time of tile choice
+	// (TerrainConstraint transforms bits/coords on generation to avoid duplicates
+	// It is easier to store and retrieve a record of the original bit/coords
+	// than to reverse the calculations)
+	TypedArray<Dictionary> evaluated_terrain_bits;
+	for (const TerrainConstraint &c : p_constraints) {
+		Dictionary evaluated_terrain_bit;
+		evaluated_terrain_bit["coords"] = c.get_original_coords();
+		evaluated_terrain_bit["bit"] = c.get_original_bit();
+		evaluated_terrain_bit["terrain"] = c.get_terrain();
+		evaluated_terrain_bit["priority"] = c.get_priority();
+		evaluated_terrain_bit["center_bit"] = c.is_center_bit();
+		evaluated_terrain_bits.push_back(evaluated_terrain_bit);
+	}
+
+	// evaluated_patterns will be populated with every tile pattern that
+	// has been tested and considered a viable choice for this cell
+	// (rejected_patterns are populated with the non-viable choices)
+	TypedArray<Dictionary> evaluated_patterns;
+	TypedArray<Dictionary> rejected_patterns_center_bit;
+	TypedArray<Dictionary> rejected_patterns_peering_bit;
+
+	// target_bits is a picture of the algorithm's ideal tile choice.
+	// Create an empty template here and populate it in the loop below.
+	Dictionary target_bits;
+	for (int i = 0; i < TileSet::CELL_NEIGHBOR_MAX; i++) {
+		TileSet::CellNeighbor bit = TileSet::CellNeighbor(i);
+		if (tile_set->is_valid_terrain_peering_bit(p_terrain_set, bit)) {
+			Dictionary bit_properties;
+			bit_properties["terrain"] = null_terrain;
+			bit_properties["priority"] = null_priority;
+			bit_properties["origin"] = null_origin;
+			target_bits[bit] = bit_properties;
+		}
+	}
+	Dictionary bit_properties;
+	bit_properties["terrain"] = null_terrain;
+	bit_properties["priority"] = null_priority;
+	target_bits[center_bit_id] = bit_properties;
+	
 	// Returns all tiles compatible with the given constraints.
 	RBMap<TileSet::TerrainsPattern, int> terrain_pattern_score;
 	RBSet<TileSet::TerrainsPattern> pattern_set = tile_set->get_terrains_pattern_set(p_terrain_set);
@@ -2316,15 +2370,69 @@ TileSet::TerrainsPattern TileMap::_get_best_terrain_pattern_for_constraints(int 
 	for (TileSet::TerrainsPattern &terrain_pattern : pattern_set) {
 		int score = 0;
 
+		// Store the currently evaluated pattern as a specific tile to allow easy
+		// transfer to GDscript.
+		TileMapCell tile_map_cell = tile_set->get_random_tile_from_terrains_pattern(p_terrain_set, terrain_pattern);
+		Dictionary tile_pattern_dict;
+		tile_pattern_dict["source_id"] = tile_map_cell.source_id;
+		tile_pattern_dict["atlas_coords"] = tile_map_cell.get_atlas_coords();
+		// bit_scores has similar structure to target_bits above
+		// but will only store bits with scores assigned
+		Dictionary bit_scores;
+
 		// Check the center bit constraint
 		TerrainConstraint terrain_constraint = TerrainConstraint(this, p_position, terrain_pattern.get_terrain());
 		const RBSet<TerrainConstraint>::Element *in_set_constraint_element = p_constraints.find(terrain_constraint);
 		if (in_set_constraint_element) {
+			// Add the center bit constraint to target_bits
+			Dictionary target_bit_properties = target_bits[center_bit_id];
+			int assigned_target_terrain = target_bit_properties["terrain"];
+			int assigned_target_priority = target_bit_properties["priority"];
+			int target_terrain = in_set_constraint_element->get().get_terrain();
+			int target_priority = in_set_constraint_element->get().get_priority();
+			int target_origin = in_set_constraint_element->get().get_origin();
+			if (assigned_target_terrain == null_terrain) {
+				target_bit_properties["terrain"] = target_terrain;
+				target_bit_properties["priority"] = target_priority;
+				target_bit_properties["origin"] = target_origin;
+			} else if (assigned_target_terrain != target_terrain) {
+				print_error("center bit constraints with different terrains found");
+			} else if (assigned_target_priority != target_priority) {
+				print_error("center bit constraints with different priorities found");
+			}
+
 			if (in_set_constraint_element->get().get_terrain() != terrain_constraint.get_terrain()) {
 				score += in_set_constraint_element->get().get_priority();
+				// Add the center bit score to the evaluated pattern
+				Dictionary bit_score;
+				bit_score["terrain"] = target_terrain;
+				bit_score["priority"] = target_priority;
+				bit_score["origin"] = target_origin;
+				bit_scores[center_bit_id] = bit_score;
 			}
 		} else if (p_current_pattern.get_terrain() != terrain_pattern.get_terrain()) {
+			// Add the rejected pattern
+			rejected_patterns_center_bit.push_back(tile_pattern_dict); 
 			continue; // Ignore a pattern that cannot keep bits without constraints unmodified.
+		}
+		// To avoid making structural changes to the original code,
+		// process this separately.
+		if (!in_set_constraint_element) {
+			// Add the required center bit to target_bits
+			Dictionary target_bit_properties = target_bits[center_bit_id];
+			int assigned_target_terrain = target_bit_properties["terrain"];
+			int assigned_target_priority = target_bit_properties["priority"];
+			int target_terrain = terrain_pattern.get_terrain();
+			int target_priority = required_priority;
+			if (assigned_target_terrain == null_terrain) {
+				target_bit_properties["terrain"] = target_terrain;
+				target_bit_properties["priority"] = target_priority;
+				target_bit_properties["origin"] = ORIGIN_DEFAULT_TO_CURRENT_TILE;
+			} else if (assigned_target_terrain != target_terrain) {
+				print_error("assigning required terrain and center bit constraint with different terrain found");
+			} else if (assigned_target_priority != target_priority) {
+				print_error("assigning required priority and center bit constraint with different priority found");
+			}
 		}
 
 		// Check the surrounding bits
@@ -2336,12 +2444,55 @@ TileSet::TerrainsPattern TileMap::_get_best_terrain_pattern_for_constraints(int 
 				TerrainConstraint terrain_bit_constraint = TerrainConstraint(this, p_position, bit, terrain_pattern.get_terrain_peering_bit(bit));
 				in_set_constraint_element = p_constraints.find(terrain_bit_constraint);
 				if (in_set_constraint_element) {
+					// Add the peering bit constraint to target_bits
+					Dictionary target_bit_properties = target_bits[bit];
+					int assigned_target_terrain = target_bit_properties["terrain"];
+					int assigned_target_priority = target_bit_properties["priority"];
+					int target_terrain = in_set_constraint_element->get().get_terrain();
+					int target_priority = in_set_constraint_element->get().get_priority();
+					int target_origin = in_set_constraint_element->get().get_origin();
+
+					if (assigned_target_terrain == null_terrain) {
+						target_bit_properties["terrain"] = target_terrain;
+						target_bit_properties["priority"] = target_priority;
+						target_bit_properties["origin"] = target_origin;
+					} else if (assigned_target_terrain != target_terrain) {
+						print_error("bit constraints with different terrains found");
+					} else if (assigned_target_priority != target_priority) {
+						print_error("bit constraints with different priorities found");
+					}
+
 					if (in_set_constraint_element->get().get_terrain() != terrain_bit_constraint.get_terrain()) {
 						score += in_set_constraint_element->get().get_priority();
+						// Add the peering bit score to the evaluated pattern
+						Dictionary bit_score;
+						bit_score["terrain"] = target_terrain;
+						bit_score["priority"] = target_priority;
+						bit_score["origin"] = target_origin;
+						bit_scores[bit] = bit_score;
 					}
 				} else if (p_current_pattern.get_terrain_peering_bit(bit) != terrain_pattern.get_terrain_peering_bit(bit)) {
 					invalid_pattern = true; // Ignore a pattern that cannot keep bits without constraints unmodified.
+					// Add the rejected pattern
+					rejected_patterns_peering_bit.push_back(tile_pattern_dict); 
 					break;
+				}
+				if (!in_set_constraint_element) {
+					// Add the required peering bit to target_bits
+					Dictionary target_bit_properties = target_bits[bit];
+					int assigned_target_terrain = target_bit_properties["terrain"];
+					int assigned_target_priority = target_bit_properties["priority"];
+					int target_terrain = terrain_pattern.get_terrain_peering_bit(bit);
+					int target_priority = required_priority;
+					if (assigned_target_terrain == null_terrain) {
+						target_bit_properties["terrain"] = target_terrain;
+						target_bit_properties["priority"] = target_priority;
+						target_bit_properties["origin"] = ORIGIN_DEFAULT_TO_CURRENT_TILE;
+					} else if (assigned_target_terrain != target_terrain) {
+						print_error("assigning required terrain and bit constraint with different terrain found");
+					} else if (assigned_target_priority != target_priority) {
+						print_error("assigning required priority and bit constraint with different priority found");
+					}
 				}
 			}
 		}
@@ -2350,18 +2501,59 @@ TileSet::TerrainsPattern TileMap::_get_best_terrain_pattern_for_constraints(int 
 		}
 
 		terrain_pattern_score[terrain_pattern] = score;
+		tile_pattern_dict["bit_scores"] = bit_scores;
+		tile_pattern_dict["score"] = score;
+		evaluated_patterns.push_back(tile_pattern_dict);
 	}
 
 	// Compute the minimum score
 	TileSet::TerrainsPattern min_score_pattern = p_current_pattern;
 	int min_score = INT32_MAX;
+	// min_score_results will record a replay of the tile selection process
+	TypedArray<Dictionary> min_score_results;
+	// Get the current (soon-to-be previous) tile
+	// and record it as the starting choice for min_score_pattern
+	TileMapCell previous_tile_map_cell = tile_set->get_random_tile_from_terrains_pattern(p_terrain_set, p_current_pattern);
+	Dictionary previous_pattern_dict;
+	previous_pattern_dict["source_id"] = previous_tile_map_cell.source_id;
+	previous_pattern_dict["atlas_coords"] = previous_tile_map_cell.get_atlas_coords();
+	previous_pattern_dict["score"] = min_score;
+	min_score_results.push_back(previous_pattern_dict);
 	for (KeyValue<TileSet::TerrainsPattern, int> E : terrain_pattern_score) {
 		if (E.value < min_score) {
 			min_score_pattern = E.key;
 			min_score = E.value;
+			// Record the next choice for min_score_pattern
+			TileMapCell tile_map_cell = tile_set->get_random_tile_from_terrains_pattern(p_terrain_set, E.key);
+			Dictionary min_score_pattern_dict;
+			min_score_pattern_dict["atlas_coords"] = tile_map_cell.get_atlas_coords();
+			min_score_pattern_dict["source_id"] = tile_map_cell.source_id;
+			min_score_pattern_dict["score"] = E.value;
+			min_score_results.push_back(min_score_pattern_dict);
 		}
 	}
 
+	// The final min_score_pattern becomes the selected tile
+	TileMapCell tile_map_cell = tile_set->get_random_tile_from_terrains_pattern(p_terrain_set, min_score_pattern);
+	Dictionary selected_pattern_dict;
+	selected_pattern_dict["source_id"] = tile_map_cell.source_id;
+	selected_pattern_dict["atlas_coords"] = tile_map_cell.get_atlas_coords();
+	selected_pattern_dict["score"] = min_score;
+
+	// Store all collected data in results and emit it in a signal
+	Dictionary results;
+	results["coords"] = p_position;
+	results["terrain_set"] = p_terrain_set;
+	results["selected_tile"] = selected_pattern_dict;
+	results["previous_tile"] = previous_pattern_dict;
+	results["min_score_tiles"] = min_score_results;
+	results["evaluated_tiles"] = evaluated_patterns;
+	results["rejected_tiles_center_bit"] = rejected_patterns_center_bit;
+	results["rejected_tiles_peering_bit"] = rejected_patterns_peering_bit;
+	results["evaluated_terrain_bits"] = evaluated_terrain_bits;
+	results["target_bits"] = target_bits;
+	emit_signal(SNAME("best_terrain_pattern_for_constraints_found"), results);
+	
 	return min_score_pattern;
 }
 
@@ -2372,12 +2564,15 @@ RBSet<TileMap::TerrainConstraint> TileMap::_get_terrain_constraints_from_added_p
 
 	// Compute the constraints needed from the surrounding tiles.
 	RBSet<TerrainConstraint> output;
-	output.insert(TerrainConstraint(this, p_position, p_terrains_pattern.get_terrain()));
+	TerrainConstraint constraint = TerrainConstraint(this, p_position, p_terrains_pattern.get_terrain());
+	constraint.set_origin(ORIGIN_ADDED_PATTERN);
+	output.insert(constraint);
 
 	for (uint32_t i = 0; i < TileSet::CELL_NEIGHBOR_MAX; i++) {
 		TileSet::CellNeighbor side = TileSet::CellNeighbor(i);
 		if (tile_set->is_valid_terrain_peering_bit(p_terrain_set, side)) {
 			TerrainConstraint c = TerrainConstraint(this, p_position, side, p_terrains_pattern.get_terrain_peering_bit(side));
+			c.set_origin(ORIGIN_ADDED_PATTERN);
 			output.insert(c);
 		}
 	}
@@ -2448,6 +2643,7 @@ RBSet<TileMap::TerrainConstraint> TileMap::_get_terrain_constraints_from_painted
 		if (max > 0) {
 			TerrainConstraint c = E_constraint;
 			c.set_terrain(max_terrain);
+			c.set_origin(ORIGIN_OVERLAPPING_BITS);
 			constraints.insert(c);
 		}
 	}
@@ -2466,7 +2662,9 @@ RBSet<TileMap::TerrainConstraint> TileMap::_get_terrain_constraints_from_painted
 
 		int terrain = (tile_data && tile_data->get_terrain_set() == p_terrain_set) ? tile_data->get_terrain() : -1;
 		if (!p_ignore_empty_terrains || terrain >= 0) {
-			constraints.insert(TerrainConstraint(this, E_coords, terrain));
+			TerrainConstraint c = TerrainConstraint(this, E_coords, terrain);
+			c.set_origin(ORIGIN_CURRENT_TERRAIN);
+			constraints.insert(c);
 		}
 	}
 
@@ -2477,6 +2675,12 @@ HashMap<Vector2i, TileSet::TerrainsPattern> TileMap::terrain_fill_constraints(in
 	if (!tile_set.is_valid()) {
 		return HashMap<Vector2i, TileSet::TerrainsPattern>();
 	}
+
+	// Emit signals when updates started and ended
+	// so GDScript can collect all the
+	// "best_terrain_pattern_for_constraints_found" signals
+	// as a single update
+	emit_signal(SNAME("terrain_updates_started")); 
 
 	// Copy the constraints set.
 	RBSet<TerrainConstraint> constraints = p_constraints;
@@ -2517,6 +2721,9 @@ HashMap<Vector2i, TileSet::TerrainsPattern> TileMap::terrain_fill_constraints(in
 
 		output[coords] = pattern;
 	}
+
+	emit_signal(SNAME("terrain_updates_finished")); 
+
 	return output;
 }
 
@@ -2582,6 +2789,7 @@ HashMap<Vector2i, TileSet::TerrainsPattern> TileMap::terrain_fill_connect(int p_
 	for (Vector2i coords : p_coords_array) {
 		// Constraints on the center bit.
 		TerrainConstraint c = TerrainConstraint(this, coords, p_terrain);
+		c.set_origin(ORIGIN_PAINTED_TERRAIN);
 		c.set_priority(10);
 		constraints.insert(c);
 
@@ -2590,6 +2798,7 @@ HashMap<Vector2i, TileSet::TerrainsPattern> TileMap::terrain_fill_connect(int p_
 			TileSet::CellNeighbor bit = TileSet::CellNeighbor(j);
 			if (tile_set->is_valid_terrain_peering_bit(p_terrain_set, bit)) {
 				c = TerrainConstraint(this, coords, bit, p_terrain);
+				c.set_origin(ORIGIN_NEIGHBOR_TERRAIN_IS_PAINTED_TERRAIN);
 				c.set_priority(10);
 				if ((int(bit) % 2) == 0) {
 					// Side peering bits: add the constraint if the center is of the same terrain
@@ -2678,12 +2887,14 @@ HashMap<Vector2i, TileSet::TerrainsPattern> TileMap::terrain_fill_path(int p_lay
 	for (Vector2i coords : p_path) {
 		// Constraints on the center bit
 		TerrainConstraint c = TerrainConstraint(this, coords, p_terrain);
+		c.set_origin(ORIGIN_PAINTED_TERRAIN);
 		c.set_priority(10);
 		constraints.insert(c);
 	}
 	for (int i = 0; i < p_path.size() - 1; i++) {
 		// Constraints on the peering bits.
 		TerrainConstraint c = TerrainConstraint(this, p_path[i], neighbor_list[i], p_terrain);
+		c.set_origin(ORIGIN_PATH_NEIGHBOR);
 		c.set_priority(10);
 		constraints.insert(c);
 	}
@@ -4161,6 +4372,19 @@ void TileMap::_bind_methods() {
 	ADD_PROPERTY_DEFAULT("format", FORMAT_1);
 
 	ADD_SIGNAL(MethodInfo("changed"));
+
+	// Bind Terrain Debugger signals and enum constants
+	ADD_SIGNAL(MethodInfo("best_terrain_pattern_for_constraints_found")); 
+	ADD_SIGNAL(MethodInfo("terrain_updates_started")); 
+	ADD_SIGNAL(MethodInfo("terrain_updates_finished")); 
+
+	BIND_ENUM_CONSTANT(ORIGIN_PAINTED_TERRAIN);
+	BIND_ENUM_CONSTANT(ORIGIN_NEIGHBOR_TERRAIN_IS_PAINTED_TERRAIN);
+	BIND_ENUM_CONSTANT(ORIGIN_PATH_NEIGHBOR);
+	BIND_ENUM_CONSTANT(ORIGIN_ADDED_PATTERN);
+	BIND_ENUM_CONSTANT(ORIGIN_OVERLAPPING_BITS);
+	BIND_ENUM_CONSTANT(ORIGIN_CURRENT_TERRAIN);
+	BIND_ENUM_CONSTANT(ORIGIN_DEFAULT_TO_CURRENT_TILE);
 
 	BIND_ENUM_CONSTANT(VISIBILITY_MODE_DEFAULT);
 	BIND_ENUM_CONSTANT(VISIBILITY_MODE_FORCE_HIDE);
