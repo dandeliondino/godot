@@ -2676,11 +2676,7 @@ HashMap<Vector2i, TileSet::TerrainsPattern> TileMap::terrain_fill_constraints(in
 		return HashMap<Vector2i, TileSet::TerrainsPattern>();
 	}
 
-	// Emit signals when updates started and ended
-	// so GDScript can collect all the
-	// "best_terrain_pattern_for_constraints_found" signals
-	// as a single update
-	emit_signal(SNAME("terrain_updates_started")); 
+	
 
 	// Copy the constraints set.
 	RBSet<TerrainConstraint> constraints = p_constraints;
@@ -2732,6 +2728,13 @@ HashMap<Vector2i, TileSet::TerrainsPattern> TileMap::terrain_fill_connect(int p_
 	ERR_FAIL_COND_V(!tile_set.is_valid(), output);
 	ERR_FAIL_INDEX_V(p_terrain_set, tile_set->get_terrain_sets_count(), output);
 
+	
+
+	TypedArray<Vector2i> painted_coords_array;
+
+
+
+
 	// Build list and set of tiles that can be modified (painted and their surroundings)
 	Vector<Vector2i> can_modify_list;
 	RBSet<Vector2i> can_modify_set;
@@ -2741,6 +2744,7 @@ HashMap<Vector2i, TileSet::TerrainsPattern> TileMap::terrain_fill_connect(int p_
 		can_modify_list.push_back(coords);
 		can_modify_set.insert(coords);
 		painted_set.insert(coords);
+		painted_coords_array.append(coords);
 	}
 	for (Vector2i coords : p_coords_array) {
 		// Find the adequate neighbor
@@ -2829,6 +2833,12 @@ HashMap<Vector2i, TileSet::TerrainsPattern> TileMap::terrain_fill_connect(int p_
 		constraints.insert(c);
 	}
 
+	// Emit signals when updates started and ended
+	// so GDScript can collect all the
+	// "best_terrain_pattern_for_constraints_found" signals
+	// as a single update
+	emit_signal(SNAME("terrain_updates_started"), painted_coords_array, p_terrain_set, p_terrain, false);
+
 	// Fill the terrains.
 	output = terrain_fill_constraints(p_layer, can_modify_list, p_terrain_set, constraints);
 	return output;
@@ -2857,6 +2867,8 @@ HashMap<Vector2i, TileSet::TerrainsPattern> TileMap::terrain_fill_path(int p_lay
 		neighbor_list.push_back(found_bit);
 	}
 
+	TypedArray<Vector2i> painted_coords_array;
+
 	// Build list and set of tiles that can be modified (painted and their surroundings)
 	Vector<Vector2i> can_modify_list;
 	RBSet<Vector2i> can_modify_set;
@@ -2866,6 +2878,7 @@ HashMap<Vector2i, TileSet::TerrainsPattern> TileMap::terrain_fill_path(int p_lay
 		can_modify_list.push_back(coords);
 		can_modify_set.insert(coords);
 		painted_set.insert(coords);
+		painted_coords_array.append(coords);
 	}
 	for (Vector2i coords : p_path) {
 		// Find the adequate neighbor
@@ -2903,6 +2916,8 @@ HashMap<Vector2i, TileSet::TerrainsPattern> TileMap::terrain_fill_path(int p_lay
 	for (TerrainConstraint c : _get_terrain_constraints_from_painted_cells_list(p_layer, painted_set, p_terrain_set, p_ignore_empty_terrains)) {
 		constraints.insert(c);
 	}
+
+	emit_signal(SNAME("terrain_updates_started"), painted_coords_array, p_terrain_set, p_terrain, true);
 
 	// Fill the terrains.
 	output = terrain_fill_constraints(p_layer, can_modify_list, p_terrain_set, constraints);
